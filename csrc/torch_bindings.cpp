@@ -190,6 +190,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int numRows, int stride0, int stride1, int topK) -> ()");
   ops.impl("top_k_per_row_decode", torch::kCUDA, &top_k_per_row_decode);
 
+  ops.def(
+      "large_context_topk(Tensor score, Tensor indices, Tensor lengths, "
+      "Tensor? "
+      "row_starts_opt) -> ()");
+  ops.impl("large_context_topk", torch::kCUDA, &large_context_topk);
+
   // Layernorm-quant
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(
@@ -259,14 +265,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // custom types:
   // https://docs.google.com/document/d/18fBMPuOJ0fY5ZQ6YyrHUppw9FA332CpNtgB6SOIgyuA
 
-  // Marlin_24 (Sparse) Optimized Quantized GEMM for GPTQ.
-  ops.def(
-      "gptq_marlin_24_gemm(Tensor a, Tensor b_q_weight, Tensor b_meta, "
-      "Tensor b_scales, Tensor workspace, "
-      "int b_q_type, "
-      "SymInt size_m, SymInt size_n, SymInt size_k) -> Tensor");
-  //  conditionally compiled so impl in source file
-
   // Machete (Dense) Optimized Mixed Precision GEMM for Hopper.
   ops.def(
       "machete_supported_schedules("
@@ -303,9 +301,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("permute_cols(Tensor A, Tensor perm) -> Tensor");
   ops.impl("permute_cols", torch::kCUDA, &permute_cols);
 
-  // gptq_marlin Optimized Quantized GEMM for GPTQ.
+  // Marlin Optimized Quantized GEMM (supports GPTQ, AWQ, FP8, NVFP4, MXFP4).
   ops.def(
-      "gptq_marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
+      "marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
       "Tensor? b_bias_or_none,Tensor b_scales, "
       "Tensor? a_scales, Tensor? global_scale, Tensor? b_zeros_or_none, "
       "Tensor? "
@@ -546,7 +544,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // Compute NVFP4 block quantized tensor.
   ops.def(
       "scaled_fp4_quant(Tensor! output, Tensor input,"
-      "                 Tensor! output_scale, Tensor input_scale) -> ()");
+      "                 Tensor! output_scale, Tensor input_scale, bool "
+      "is_sf_swizzled_layout) -> ()");
   ops.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant);
 
   // Compute NVFP4 experts quantization.
@@ -580,6 +579,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "use_v2_format, int bit) "
       "-> Tensor");
   ops.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
+
+  // Fused MoE GPTQ GEMM using exllama 4-bit kernel with expert routing.
+  ops.def(
+      "fused_moe_exllama_gemm(Tensor a, Tensor b_q_weight, "
+      "Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor! c, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor topk_weights, "
+      "int top_k, bool mul_routed_weight, "
+      "int block_size_m) -> ()");
+  ops.impl("fused_moe_exllama_gemm", torch::kCUDA, &fused_moe_exllama_gemm);
 
   // Post processing for GPTQ.
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
@@ -644,11 +653,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
 #ifndef USE_ROCM
   // Compute per-token-group FP8 quantized tensor and scaling factor.
+  // The dummy arguments are here so we can correctly fuse with RMSNorm.
   ops.def(
       "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "
       "output_s, "
       "int group_size, float eps, float fp8_min, float fp8_max, bool "
-      "scale_ue8m0) -> ()");
+      "scale_ue8m0, bool dummy_is_scale_transposed, bool dummy_is_tma_aligned "
+      ") -> ()");
   ops.impl("per_token_group_fp8_quant", torch::kCUDA,
            &per_token_group_quant_fp8);
 
@@ -692,7 +703,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   // Cache ops
   // Swap in (out) the cache blocks from src to dst.
   cache_ops.def(
-      "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()");
+      "swap_blocks(Tensor src, Tensor! dst,"
+      "            int block_size_in_bytes, Tensor block_mapping) -> ()");
   cache_ops.impl("swap_blocks", torch::kCUDA, &swap_blocks);
 
   // Reshape the key and value tensors and cache them.

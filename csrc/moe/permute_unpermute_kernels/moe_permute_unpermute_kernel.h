@@ -5,11 +5,119 @@
 #include <c10/core/ScalarType.h>
 #include <torch/all.h>
 #include "dispatch.h"
-#include <cub/cub.cuh>
-#include <cub/device/device_radix_sort.cuh>
-#include <cub/util_type.cuh>
-#include "cutlass/numeric_size.h"
-#include "cutlass/array.h"
+
+#ifdef USE_ROCM
+  #include <hip/hip_runtime.h>
+  #include <hipcub/hipcub.hpp>
+#else
+  #include <cub/cub.cuh>
+  #include <cub/device/device_radix_sort.cuh>
+  #include <cub/util_type.cuh>
+#endif
+
+// ============================================================================
+// cutlass replacements for ROCm (cutlass is not available on HIP)
+// ============================================================================
+#ifdef USE_ROCM
+
+namespace cutlass {
+
+// Drop in replacement for cutlass::Array with the only strictily required
+// methods
+template <typename T, int N>
+struct Array {
+  static constexpr int kElements = N;
+  using Element = T;
+  T storage[N];
+
+  __host__ __device__ T& operator[](int i) { return storage[i]; }
+  __host__ __device__ const T& operator[](int i) const { return storage[i]; }
+
+  __host__ __device__ void fill(T val) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) storage[i] = val;
+  }
+
+  __host__ __device__ Array operator+(const Array& rhs) const {
+    Array result;
+#pragma unroll
+    for (int i = 0; i < N; ++i) result[i] = storage[i] + rhs[i];
+    return result;
+  }
+};
+
+template <typename T, int N>
+__host__ __device__ Array<T, N> operator*(T scalar, const Array<T, N>& arr) {
+  Array<T, N> result;
+#pragma unroll
+  for (int i = 0; i < N; ++i) result[i] = scalar * arr[i];
+  return result;
+}
+
+template <typename T>
+struct sizeof_bits {
+  static constexpr int value = sizeof(T) * 8;
+};
+
+template <>
+struct sizeof_bits<hip_bfloat16> {
+  static constexpr int value = 16;
+};
+
+}  // namespace cutlass
+
+// Type conversion helpers for ROCm (where __HIP_NO_HALF_CONVERSIONS__ is set)
+template <typename To, typename From>
+__host__ __device__ inline To rocm_moe_convert(From val) {
+  return static_cast<To>(val);
+}
+
+template <>
+__host__ __device__ inline float rocm_moe_convert<float, __half>(__half val) {
+  return __half2float(val);
+}
+
+template <>
+__host__ __device__ inline __half rocm_moe_convert<__half, float>(float val) {
+  return __float2half(val);
+}
+
+template <>
+__host__ __device__ inline float rocm_moe_convert<float, __hip_fp8_e4m3>(
+    __hip_fp8_e4m3 val) {
+  __half_raw hr = __hip_cvt_fp8_to_halfraw(val.__x, __HIP_E4M3);
+  return rocm_moe_convert<float, __half>(__half(hr));
+}
+
+template <>
+__host__ __device__ inline __hip_fp8_e4m3 rocm_moe_convert<__hip_fp8_e4m3, float>(
+    float val) {
+  __hip_fp8_e4m3 result;
+  result.__x = __hip_cvt_float_to_fp8(val, __HIP_SATFINITE, __HIP_E4M3);
+  return result;
+}
+
+template <>
+__host__ __device__ inline float rocm_moe_convert<float, __hip_fp8_e5m2>(
+    __hip_fp8_e5m2 val) {
+  __half_raw hr = __hip_cvt_fp8_to_halfraw(val.__x, __HIP_E5M2);
+  return rocm_moe_convert<float, __half>(__half(hr));
+}
+
+template <>
+__host__ __device__ inline __hip_fp8_e5m2 rocm_moe_convert<__hip_fp8_e5m2, float>(
+    float val) {
+  __hip_fp8_e5m2 result;
+  result.__x = __hip_cvt_float_to_fp8(val, __HIP_SATFINITE, __HIP_E5M2);
+  return result;
+}
+
+#else  // !USE_ROCM
+
+  #include "cutlass/numeric_size.h"
+  #include "cutlass/array.h"
+
+#endif  // USE_ROCM
 
 template <typename T>
 inline T* get_ptr(torch::Tensor& t) {
@@ -48,7 +156,7 @@ void computeExpertFirstTokenOffset(int const* sorted_indices,
                                    int64_t* expert_first_token_offset,
                                    cudaStream_t stream);
 
-void sortAndScanExpert(int* expert_for_source_row, const int* source_rows,
+void sortAndScanExpert(const int* expert_for_source_row, const int* source_rows,
                        int* permuted_experts, int* permuted_rows,
                        int64_t* expert_first_token_offset, int num_rows,
                        int num_experts, int num_experts_per_node, int k,
@@ -60,9 +168,9 @@ void expandInputRowsKernelLauncher(
     T const* unpermuted_input, T* permuted_output, int* sorted_experts,
     int const* expanded_dest_row_to_expanded_source_row,
     int* expanded_source_row_to_expanded_dest_row, int* permuted_idx,
-    int64_t* expert_first_token_offset, int64_t const num_rows,
+    int64_t const* expert_first_token_offset, int64_t const num_rows,
     int64_t const* num_valid_tokens_ptr, int64_t const cols, int const k,
-    int num_local_experts, const int& align_block_size, cudaStream_t stream);
+    int num_local_experts, cudaStream_t stream);
 
 template <class T, class OutputType>
 void finalizeMoeRoutingKernelLauncher(
@@ -74,10 +182,5 @@ void finalizeMoeRoutingKernelLauncher(
 void preprocessTopkIdLauncher(int* topk_id_ptr, int size,
                               const int* expert_map_ptr, int num_experts,
                               cudaStream_t stream);
-
-void getMIndices(int64_t* expert_first_token_offset,
-                 int64_t* align_expert_first_token_offset, int* m_indices,
-                 int num_local_expert, const int align_block_size,
-                 cudaStream_t stream);
 
 #include "moe_permute_unpermute_kernel.inl"

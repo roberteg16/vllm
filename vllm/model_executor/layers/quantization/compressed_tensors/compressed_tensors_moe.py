@@ -19,36 +19,38 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     FusedMoEActivationFormat,
-    FusedMoEConfig,
     FusedMoEMethodBase,
     FusedMoEPermuteExpertsUnpermute,
-    FusedMoERouter,
     FusedMoeWeightScaleSupported,
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
     FusedMoEQuantConfig,
-    fp8_w8a8_moe_quant_config,
-    fp8_w8a16_moe_quant_config,
     int4_w4a16_moe_quant_config,
     int4_w4afp8_moe_quant_config,
     int8_w8a8_moe_quant_config,
     int8_w8a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.cpu_fused_moe import select_experts
+from vllm.model_executor.layers.fused_moe.exllama_moe import ExllamaExperts
 from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
     BatchedMarlinExperts,
     MarlinExperts,
     fused_marlin_moe,
 )
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEModularKernel,
+)
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
+    make_fp8_moe_quant_config,
     select_fp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
-    FLASHINFER_NVFP4_MOE_BACKENDS,
     NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
@@ -57,15 +59,24 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     make_nvfp4_moe_quant_config,
     select_nvfp4_moe_backend,
 )
+from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+    MoEPrepareAndFinalizeNoEP,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
     WNA16_SUPPORTED_BITS,
     WNA16_SUPPORTED_TYPES_MAP,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
-    build_flashinfer_fp4_cutlass_moe_prepare_finalize,
     flashinfer_trtllm_fp4_moe,
     flashinfer_trtllm_fp4_routed_moe,
-    select_nvfp4_gemm_impl,
+)
+from vllm.model_executor.layers.quantization.utils.flashinfer_mxint4_moe import (
+    flashinfer_trtllm_mxint4_moe,
+    is_flashinfer_mxint4_moe_available,
+    prepare_static_weights_for_trtllm_mxint4_moe,
+)
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    apply_fi_trtllm_fp8_per_tensor_moe,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_input_tensor_strategy_moe,
@@ -79,12 +90,18 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_moe_permute_scales,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-    is_fp4_marlin_supported,
     prepare_moe_fp4_layer_for_marlin,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     convert_bf16_scales_to_fp8,
     convert_packed_uint4b8_to_signed_int4_inplace,
+    kFp8Dynamic128Sym,
+    kFp8DynamicTokenSym,
+    kFp8Static128BlockSym,
+    kFp8StaticChannelSym,
+    kFp8StaticTensorSym,
+    kNvfp4Dynamic,
+    kNvfp4Static,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
@@ -117,7 +134,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
         layer: torch.nn.Module,
         layer_name: str,
-    ) -> "CompressedTensorsMoEMethod":
+    ) -> FusedMoEMethodBase:
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
@@ -200,7 +217,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     f"or None for NVFP4A16, found {input_quant}",
                 )
             return CompressedTensorsW4A4Nvfp4MoEMethod(
-                layer.moe_config, layer_name, use_marlin=input_quant is None
+                layer.moe_config, layer_name, use_a16=(input_quant is None)
             )
         elif (
             quant_config._is_fp8_w8a8_sm90(weight_quant, input_quant)
@@ -234,7 +251,7 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
         super().__init__(moe)
         self.group_size = 32
         self.mxfp4_backend = NvFp4MoeBackend.MARLIN
-        self.kernel: mk.FusedMoEModularKernel | None = None
+        self.experts_cls = MarlinExperts
 
     def create_weights(
         self,
@@ -311,7 +328,7 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
             w13_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale
         )
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: FusedMoE) -> None:
         layer.w13_weight = torch.nn.Parameter(
             layer.w13_weight_packed.data, requires_grad=False
         )
@@ -326,40 +343,34 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config is not None:
-            self.kernel = make_nvfp4_moe_kernel(
-                backend=self.mxfp4_backend,
-                quant_config=self.moe_quant_config,
+            self.moe_mk = make_nvfp4_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                shared_experts=layer.shared_experts,
+                routing_tables=layer._maybe_init_expert_routing_tables(),
             )
 
     def apply(
         self,
         layer: FusedMoE,
-        router: FusedMoERouter,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(x, tuple):
-            x_routing, _ = x
-        else:
-            x_routing = x
-
-        topk_weights, topk_ids = router.select_experts(
-            hidden_states=x_routing,
-            router_logits=router_logits,
-        )
-        assert self.kernel is not None
-        return self.kernel(
+        assert self.moe_mk is not None
+        return self.moe_mk(
             x,
             layer.w13_weight,
             layer.w2_weight,
             topk_weights,
             topk_ids,
-            inplace=False,
             activation=layer.activation,
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts_input=shared_experts_input,
         )
 
 
@@ -368,34 +379,21 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         self,
         moe: FusedMoEConfig,
         layer_name: str | None = None,
-        use_marlin: bool = False,
+        use_a16: bool = False,
     ):
         super().__init__(moe)
         self.group_size = 16
-        if use_marlin:
-            if is_fp4_marlin_supported():
-                self.nvfp4_backend = NvFp4MoeBackend.MARLIN
-            else:
-                raise ValueError(
-                    "Marlin FP4 MoE kernel requested but not ",
-                    "supported on current platform.",
-                )
-        else:
-            self.nvfp4_backend = select_nvfp4_moe_backend()
 
-        # TODO: move this type of check into the oracle.
-        if not self.moe.is_act_and_mul and self.nvfp4_backend not in [
-            NvFp4MoeBackend.FLASHINFER_CUTLASS,
-            NvFp4MoeBackend.MARLIN,
-        ]:
-            raise NotImplementedError(
-                "Non-gated activations are only supported by FlashInfer "
-                f"CUTLASS and Marlin NvFP4 MoE backends, not {self.nvfp4_backend}."
-            )
+        # Select experts implementation.
+        self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
+            config=self.moe,
+            weight_key=kNvfp4Static,
+            activation_key=None if use_a16 else kNvfp4Dynamic,
+        )
+
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
         )
-        self.kernel: mk.FusedMoEModularKernel | None = None
 
     def create_weights(
         self,
@@ -510,7 +508,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         )
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: FusedMoE) -> None:
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
@@ -571,50 +569,39 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         layer.w13_input_scale = a13_scale
         layer.w2_input_scale = a2_scale
 
-        # Initialize the kernel that will be called in apply().
+        # Setup modular kernel for TP case and naive DP/EP case.
+        # In non-naive DP/EP case, we will create a ModularKernelMethod.
+        # TODO(rob): unify these so FP8MoEMethod owns the ModularKernel
+        # in both cases.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        use_dp = self.moe.dp_size > 1
-        if self.moe_quant_config is not None and not use_dp:
-            self.kernel = make_nvfp4_moe_kernel(
-                backend=self.nvfp4_backend,
-                quant_config=self.moe_quant_config,
+        if self.moe_quant_config:
+            assert self.experts_cls is not None
+            self.moe_mk = make_nvfp4_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                shared_experts=layer.shared_experts,
+                routing_tables=layer._maybe_init_expert_routing_tables(),
             )
 
     def maybe_make_prepare_finalize(
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> mk.FusedMoEPrepareAndFinalize | None:
-        UNSUPPORTED = [NvFp4MoeBackend.MARLIN, NvFp4MoeBackend.FLASHINFER_TRTLLM]
-        if self.nvfp4_backend in UNSUPPORTED:
-            return None
-        elif self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTLASS:
-            # TP case: avoid convert to ModularKernelMethod - to be refactored.
-            if self.moe.dp_size == 1:
-                return None
-            # For now, fp4 moe only works with the flashinfer dispatcher.
-            prepare_finalize = build_flashinfer_fp4_cutlass_moe_prepare_finalize(
-                self.moe
-            )
-            logger.debug_once("%s", prepare_finalize.__class__.__name__)
-            return prepare_finalize
-        else:
-            return super().maybe_make_prepare_finalize(routing_tables)
+        raise ValueError(
+            f"{self.__class__.__name__} uses the new modular kernel initialization "
+            "logic. This function should not be called."
+        )
 
     def select_gemm_impl(
         self,
         prepare_finalize: mk.FusedMoEPrepareAndFinalize,
         layer: torch.nn.Module,
     ) -> mk.FusedMoEPermuteExpertsUnpermute:
-        assert self.moe_quant_config is not None
-        """Return the appropriate GEMM experts implementation."""
-        experts = select_nvfp4_gemm_impl(
-            self.moe,
-            self.moe_quant_config,
-            allow_flashinfer=(self.nvfp4_backend in FLASHINFER_NVFP4_MOE_BACKENDS),
+        raise ValueError(
+            f"{self.__class__.__name__} uses the new modular kernel initialization "
+            "logic. This function should not be called."
         )
-        logger.debug_once("Using %s", experts.__class__.__name__)
-        return experts
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -629,40 +616,51 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             a2_scale=layer.w2_input_scale,
         )
 
-    def apply(
+    @property
+    def is_monolithic(self) -> bool:
+        return (
+            self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
+            and not self.moe.moe_parallel_config.enable_eplb
+        )
+
+    def apply_monolithic(
         self,
         layer: FusedMoE,
-        router: FusedMoERouter,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        assert layer.activation == "silu", "Only SiLU activation is supported."
-
-        if (
+        assert self.is_monolithic
+        assert layer.activation == MoEActivation.SILU, (
+            f"Only SiLU activation is supported, not {layer.activation}."
+        )
+        assert (
             self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
             and not layer.enable_eplb
-        ):
-            return flashinfer_trtllm_fp4_moe(
-                layer=layer,
-                x=x,
-                router_logits=router_logits,
-                top_k=layer.top_k,
-                activation=layer.activation,
-                global_num_experts=layer.global_num_experts,
-                num_expert_group=layer.num_expert_group,
-                topk_group=layer.topk_group,
-                custom_routing_function=layer.custom_routing_function,
-                e_score_correction_bias=layer.e_score_correction_bias,
-            )
-
-        # Hidden_states in select_experts is only used to extract metadata
-        if isinstance(x, tuple):
-            x_routing, _ = x
-        else:
-            x_routing = x
-        topk_weights, topk_ids = router.select_experts(
-            hidden_states=x_routing,
+        )
+        return flashinfer_trtllm_fp4_moe(
+            layer=layer,
+            x=x,
             router_logits=router_logits,
+            top_k=layer.top_k,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            custom_routing_function=layer.custom_routing_function,
+            e_score_correction_bias=layer.e_score_correction_bias,
+        )
+
+    def apply(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert not self.is_monolithic
+        assert layer.activation == MoEActivation.SILU, (
+            f"Only SiLU activation is supported, not {layer.activation}."
         )
 
         # EPLB path
@@ -678,22 +676,24 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 global_num_experts=layer.global_num_experts,
             )
         else:
-            assert self.kernel is not None
-            return self.kernel(
+            assert self.moe_mk is not None
+            return self.moe_mk(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                inplace=False,
                 activation=layer.activation,
                 global_num_experts=layer.global_num_experts,
                 expert_map=layer.expert_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                shared_experts_input=shared_experts_input,
             )
 
 
 class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
+    """W8A8 FP8 MoE quantization using compressed tensors."""
+
     def __init__(
         self,
         weight_quant: QuantizationArgs,
@@ -727,32 +727,31 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 "For FP8 Fused MoE layer, we require either per tensor or "
                 "channelwise, dynamic per token quantization."
             )
-        self.fp8_backend = select_fp8_moe_backend(
-            block_quant=self.block_quant,
-            tp_size=moe.tp_size,
-            with_lora_support=moe.is_lora_enabled,
-            is_act_and_mul=moe.is_act_and_mul,
-            # TODO(rob): enable selecting this externally.
+
+        ct2vllm_weight = {
+            QuantizationStrategy.CHANNEL: kFp8StaticChannelSym,
+            QuantizationStrategy.TENSOR: kFp8StaticTensorSym,
+            QuantizationStrategy.BLOCK: kFp8Static128BlockSym,
+        }
+        ct2vllm_act = {
+            QuantizationStrategy.TOKEN: kFp8DynamicTokenSym,
+            QuantizationStrategy.TENSOR: (
+                kFp8StaticTensorSym if self.static_input_scales else kFp8Dynamic128Sym
+            ),
+        }
+        weight_key = ct2vllm_weight[self.weight_quant.strategy]
+        if weight_key == kFp8Static128BlockSym:
+            activation_key = kFp8Dynamic128Sym
+        else:
+            activation_key = ct2vllm_act[self.input_quant.strategy]
+
+        # Select Fp8 MoE backend
+        self.fp8_backend, self.experts_cls = select_fp8_moe_backend(
+            config=self.moe,
+            weight_key=weight_key,
+            activation_key=activation_key,
             allow_vllm_cutlass=True,
         )
-        if self.fp8_backend != Fp8MoeBackend.MARLIN:
-            per_act_token = self.input_quant.strategy == QuantizationStrategy.TOKEN
-            per_channel_quant = (
-                self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-            )
-            if per_act_token != per_channel_quant:
-                raise NotImplementedError(
-                    "For FP8 Fused MoE layers, per-token and per-channel must be "
-                    "used together."
-                )
-        # TODO(rob): hook this up in a follow up PR.
-        if self.fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM:
-            raise NotImplementedError(
-                "FlashInfer TRTLLM backend not supported for compressed-tensors yet."
-            )
-        self.disable_expert_map = False
-
-        self.kernel: mk.FusedMoEModularKernel | None = None
 
     def create_weights(
         self,
@@ -913,7 +912,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: FusedMoE) -> None:
         # Allow for accessing weights and scales in standard way.
         w13 = layer.w13_weight
         w2 = layer.w2_weight
@@ -970,171 +969,137 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
 
+        # Setup modular kernel for TP case and naive DP/EP case.
+        # In non-naive DP/EP case, we will create a ModularKernelMethod.
+        # TODO(rob): unify these so FP8MoEMethod owns the ModularKernel
+        # in both cases.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config:
-            self.kernel, self.use_inplace = make_fp8_moe_kernel(
-                layer=layer,
+            assert self.experts_cls is not None
+            self.moe_mk = make_fp8_moe_kernel(
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
                 fp8_backend=self.fp8_backend,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._maybe_init_expert_routing_tables(),
+                shared_experts=layer.shared_experts,
             )
 
     def maybe_make_prepare_finalize(
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> mk.FusedMoEPrepareAndFinalize | None:
-        if self.fp8_backend in [Fp8MoeBackend.MARLIN, Fp8MoeBackend.AITER]:
-            return None
-        else:
-            return super().maybe_make_prepare_finalize(routing_tables)
+        raise ValueError(
+            f"{self.__class__.__name__} uses the new modular kernel initialization "
+            "logic. This function should not be called."
+        )
 
     def select_gemm_impl(
         self,
         prepare_finalize: mk.FusedMoEPrepareAndFinalize,
         layer: torch.nn.Module,
-    ) -> FusedMoEPermuteExpertsUnpermute:
-        # cutlass path
-        assert self.moe_quant_config is not None
-        if self.fp8_backend == Fp8MoeBackend.VLLM_CUTLASS:
-            from vllm.model_executor.layers.fused_moe import (
-                CutlassBatchedExpertsFp8,
-                CutlassExpertsFp8,
-            )
-
-            experts: FusedMoEPermuteExpertsUnpermute
-
-            num_dispatchers = prepare_finalize.num_dispatchers()
-
-            if (
-                prepare_finalize.activation_format
-                == FusedMoEActivationFormat.BatchedExperts
-            ):
-                logger.debug("CutlassBatchedExpertsFp8(%s)", self.__class__.__name__)
-                experts = CutlassBatchedExpertsFp8(
-                    max_experts_per_worker=self.moe.num_local_experts,
-                    num_dispatchers=num_dispatchers,
-                    out_dtype=self.moe.in_dtype,
-                    e=layer.local_num_experts,
-                    n=layer.intermediate_size_per_partition,
-                    k=layer.hidden_size,
-                    device=layer.w13_weight.device,
-                    quant_config=self.moe_quant_config,
-                )
-            else:
-                logger.debug("CutlassExpertsFp8(%s)", self.__class__.__name__)
-                experts = CutlassExpertsFp8(
-                    out_dtype=self.moe.in_dtype,
-                    e=layer.local_num_experts,
-                    n=layer.intermediate_size_per_partition,
-                    k=layer.hidden_size,
-                    device=layer.w13_weight.device,
-                    quant_config=self.moe_quant_config,
-                )
-
-            # TODO(rob): investigate disable_expert_map
-            self.disable_expert_map = (
-                num_dispatchers > 1 or not experts.supports_expert_map()
-            )
-
-            return experts
-
-        from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
-            BatchedDeepGemmExperts,
+    ) -> mk.FusedMoEPermuteExpertsUnpermute:
+        raise ValueError(
+            f"{self.__class__.__name__} uses the new modular kernel initialization "
+            "logic. This function should not be called."
         )
-        from vllm.model_executor.layers.fused_moe.fused_batched_moe import (
-            BatchedTritonExperts,
-        )
-        from vllm.model_executor.layers.fused_moe.fused_moe import (
-            TritonExperts,
-        )
-        from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
-            TritonOrDeepGemmExperts,
-        )
-
-        assert self.fp8_backend not in [Fp8MoeBackend.AITER, Fp8MoeBackend.MARLIN]
-
-        if (
-            prepare_finalize.activation_format
-            == FusedMoEActivationFormat.BatchedExperts
-        ):
-            max_num_tokens_per_rank = prepare_finalize.max_num_tokens_per_rank()
-            assert max_num_tokens_per_rank is not None
-
-            if self.fp8_backend == Fp8MoeBackend.DEEPGEMM:
-                logger.debug("BatchedDeepGemmExperts(%s)", self.__class__.__name__)
-                return BatchedDeepGemmExperts(
-                    max_num_tokens=max_num_tokens_per_rank,
-                    num_dispatchers=prepare_finalize.num_dispatchers(),
-                    quant_config=self.moe_quant_config,
-                )
-            else:
-                logger.debug("BatchedTritonExperts(%s)", self.__class__.__name__)
-                return BatchedTritonExperts(
-                    max_num_tokens=max_num_tokens_per_rank,
-                    num_dispatchers=prepare_finalize.num_dispatchers(),
-                    quant_config=self.moe_quant_config,
-                )
-
-        else:
-            if self.fp8_backend == Fp8MoeBackend.DEEPGEMM:
-                logger.debug("TritonOrDeepGemmExperts(%s)", self.__class__.__name__)
-                return TritonOrDeepGemmExperts(self.moe_quant_config)
-            else:
-                logger.debug("TritonExperts(%s)", self.__class__.__name__)
-                return TritonExperts(self.moe_quant_config)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        if self.fp8_backend == Fp8MoeBackend.MARLIN:
-            return fp8_w8a16_moe_quant_config(
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                block_shape=self.weight_block_size,
-            )
+        w1_scale = layer.w13_weight_scale
+        w2_scale = layer.w2_weight_scale
+        a1_scale = layer.w13_input_scale
+        a2_scale = layer.w2_input_scale
 
-        per_act_token = self.input_quant.strategy == QuantizationStrategy.TOKEN
-        per_channel_quant = self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-
-        return fp8_w8a8_moe_quant_config(
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            per_act_token_quant=per_act_token,
-            per_out_ch_quant=per_channel_quant,
-            block_shape=layer.weight_block_size,
+        return make_fp8_moe_quant_config(
+            fp8_backend=self.fp8_backend,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            per_act_token_quant=(
+                self.input_quant.strategy == QuantizationStrategy.TOKEN
+            ),
+            per_out_ch_quant=(self.input_quant.strategy == QuantizationStrategy.TOKEN),
+            block_shape=self.weight_block_size,
         )
+
+    @property
+    def is_monolithic(self) -> bool:
+        return self.fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM
+
+    def apply_monolithic(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert self.is_monolithic
+        assert self.fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM
+        assert layer.activation == MoEActivation.SILU, (
+            f"Only SiLU activation is supported, not {layer.activation}."
+        )
+
+        if self.block_quant:
+            import vllm.model_executor.layers.fused_moe.flashinfer_trtllm_moe  # noqa: E501, F401
+
+            return torch.ops.vllm.flashinfer_fused_moe_blockscale_fp8(
+                routing_logits=router_logits,
+                routing_bias=layer.e_score_correction_bias,
+                x=x,
+                w13_weight=layer.w13_weight,
+                w13_weight_scale_inv=layer.w13_weight_scale,
+                w2_weight=layer.w2_weight,
+                w2_weight_scale_inv=layer.w2_weight_scale,
+                global_num_experts=layer.global_num_experts,
+                top_k=layer.top_k,
+                num_expert_group=layer.num_expert_group,
+                topk_group=layer.topk_group,
+                intermediate_size=layer.intermediate_size_per_partition,
+                expert_offset=layer.ep_rank * layer.local_num_experts,
+                local_num_experts=layer.local_num_experts,
+                block_shape=self.weight_block_size,
+                routing_method_type=layer.routing_method_type,
+                routed_scaling=layer.routed_scaling_factor,
+            )
+        else:
+            return apply_fi_trtllm_fp8_per_tensor_moe(
+                layer=layer,
+                hidden_states=x,
+                router_logits=router_logits,
+                routing_bias=layer.e_score_correction_bias,
+                global_num_experts=layer.global_num_experts,
+                top_k=layer.top_k,
+                num_expert_group=layer.num_expert_group,
+                topk_group=layer.topk_group,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            )
 
     def apply(
         self,
         layer: FusedMoE,
-        router: FusedMoERouter,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        topk_weights, topk_ids = router.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-        )
-
-        assert self.kernel is not None
-        result = self.kernel(
+        assert not self.is_monolithic
+        assert self.moe_mk is not None
+        return self.moe_mk(
             x,
             layer.w13_weight,
             layer.w2_weight,
             topk_weights,
             topk_ids,
-            inplace=self.use_inplace,
             activation=layer.activation,
             global_num_experts=layer.global_num_experts,
             # TODO(rob): investigate the disable_expert_map introduced by:
             # https://github.com/vllm-project/vllm/commit/84166fee9770e6fba71a96978b3e7d149392fb28 # noqa: E501
-            expert_map=None if self.disable_expert_map else layer.expert_map,
+            expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts_input=shared_experts_input,
         )
-
-        return result
 
     @property
     def supports_eplb(self) -> bool:
@@ -1254,16 +1219,12 @@ class CompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
     def apply(
         self,
         layer: FusedMoE,
-        router: FusedMoERouter,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from vllm.model_executor.layers.fused_moe import fused_experts
-
-        topk_weights, topk_ids = router.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-        )
 
         return fused_experts(
             hidden_states=x,
@@ -1271,7 +1232,7 @@ class CompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
             w2=layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=True,
+            inplace=not self.moe.disable_inplace,
             activation=layer.activation,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             global_num_experts=layer.global_num_experts,
@@ -1302,8 +1263,89 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         self.actorder = weight_quant.actorder
 
         self.quant_type = WNA16_SUPPORTED_TYPES_MAP[self.num_bits]
-        self.use_marlin = True
+
         self.marlin_input_dtype = get_marlin_input_dtype(layer_name)
+        self.use_flashinfer_mxint4_moe = (
+            is_flashinfer_mxint4_moe_available()
+            and self.group_size == 32
+            and weight_quant.num_bits == 4
+        )
+        self.kernel_backend = (
+            "Flashinfer" if self.use_flashinfer_mxint4_moe else "Marlin"
+        )
+        logger.info_once(
+            f"Using {self.kernel_backend} backend for WNA16 MoE "
+            f"(group_size={self.group_size}, num_bits={self.num_bits})",
+            scope="local",
+        )
+
+    def get_weight_shape(
+        self,
+        weight_name: str,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        num_groups_w2: int | None = None,
+        num_groups_w13: int | None = None,
+    ) -> tuple[int, int, int]:
+        """
+        Get the shape of the weight based on the weight name, number of experts
+        hidden size, intermediate size per partition, number of groups for w2,
+        and number of groups for w13. Pass in num_groups_w2 and num_groups_w13
+        for weight scales.
+        """
+        if weight_name == "w13_scale":
+            assert num_groups_w13 is not None, (
+                "num_groups_w13 must be provided for weight scales"
+            )
+        if weight_name == "w2_scale":
+            assert num_groups_w2 is not None, (
+                "num_groups_w2 must be provided for weight scales"
+            )
+        w13_num_shards = 2 if self.moe.is_act_and_mul else 1
+        shape_map = {
+            "w13_weight": {
+                "Flashinfer": (
+                    num_experts,
+                    w13_num_shards * intermediate_size_per_partition,
+                    hidden_size // self.packed_factor,
+                ),
+                "Marlin": (
+                    num_experts,
+                    hidden_size // self.packed_factor,
+                    w13_num_shards * intermediate_size_per_partition,
+                ),
+            },
+            "w13_scale": {
+                "Flashinfer": (
+                    num_experts,
+                    w13_num_shards * intermediate_size_per_partition,
+                    num_groups_w13,
+                ),
+                "Marlin": (
+                    num_experts,
+                    num_groups_w13,
+                    w13_num_shards * intermediate_size_per_partition,
+                ),
+            },
+            "w2_weight": {
+                "Flashinfer": (
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // self.packed_factor,
+                ),
+                "Marlin": (
+                    num_experts,
+                    intermediate_size_per_partition // self.packed_factor,
+                    hidden_size,
+                ),
+            },
+            "w2_scale": {
+                "Flashinfer": (num_experts, hidden_size, num_groups_w2),
+                "Marlin": (num_experts, num_groups_w2, hidden_size),
+            },
+        }
+        return shape_map[weight_name][self.kernel_backend]
 
     def create_weights(
         self,
@@ -1315,19 +1357,23 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         **extra_weight_attrs,
     ):
         intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
-        w13_num_shards = 2 if self.moe.is_act_and_mul else 1
 
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
         # shard for TP along the transposed dims
+        is_transposed = self.kernel_backend != "Flashinfer"
         extra_weight_attrs.update(
-            {"is_transposed": True, "quant_method": self.strategy}
+            {"is_transposed": is_transposed, "quant_method": self.strategy}
         )
+
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
-                hidden_size // self.packed_factor,
-                w13_num_shards * intermediate_size_per_partition,
+                *self.get_weight_shape(
+                    "w13_weight",
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                ),
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -1337,9 +1383,12 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
-                intermediate_size_per_partition // self.packed_factor,
-                hidden_size,
+                *self.get_weight_shape(
+                    "w2_weight",
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                ),
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -1370,9 +1419,13 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         w13_scale = torch.nn.Parameter(
             torch.ones(
-                num_experts,
-                num_groups_w13,
-                w13_num_shards * intermediate_size_per_partition,
+                *self.get_weight_shape(
+                    "w13_scale",
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                    num_groups_w13=num_groups_w13,
+                ),
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -1381,7 +1434,16 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_scale, extra_weight_attrs)
 
         w2_scale = torch.nn.Parameter(
-            torch.ones(num_experts, num_groups_w2, hidden_size, dtype=params_dtype),
+            torch.ones(
+                *self.get_weight_shape(
+                    "w2_scale",
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                    num_groups_w2=num_groups_w2,
+                ),
+                dtype=params_dtype,
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_scale)
@@ -1451,6 +1513,27 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_weight_g_idx.shape[0]
         device = layer.w13_weight_g_idx.device
+        if self.kernel_backend == "Flashinfer":
+            dict_weights_mxint4 = prepare_static_weights_for_trtllm_mxint4_moe(
+                layer.w13_weight_packed,
+                layer.w13_weight_scale,
+                layer.w2_weight_packed,
+                layer.w2_weight_scale,
+            )
+            replace_parameter(
+                layer, "w13_weight_packed", dict_weights_mxint4["gemm1_weights"]
+            )
+            replace_parameter(
+                layer, "w13_weight_scale", dict_weights_mxint4["gemm1_scales"]
+            )
+            replace_parameter(
+                layer, "w2_weight_packed", dict_weights_mxint4["gemm2_weights"]
+            )
+            replace_parameter(
+                layer, "w2_weight_scale", dict_weights_mxint4["gemm2_scales"]
+            )
+            return None
+
         is_a_8bit = (
             self.marlin_input_dtype is not None
             and self.marlin_input_dtype.itemsize == 1
@@ -1596,6 +1679,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             return BatchedMarlinExperts(
                 max_num_tokens=max_num_tokens_per_rank,
                 num_dispatchers=prepare_finalize.num_dispatchers(),
+                moe_config=self.moe,
                 quant_config=self.moe_quant_config,
                 w13_g_idx=layer.w13_weight_g_idx,
                 w2_g_idx=layer.w2_weight_g_idx,
@@ -1605,6 +1689,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             )
         else:
             return MarlinExperts(
+                moe_config=self.moe,
                 quant_config=self.moe_quant_config,
                 w13_g_idx=layer.w13_weight_g_idx,
                 w2_g_idx=layer.w2_weight_g_idx,
@@ -1613,18 +1698,44 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 is_k_full=self.is_k_full,
             )
 
-    def apply(
+    @property
+    def is_monolithic(self) -> bool:
+        return self.kernel_backend == "Flashinfer"
+
+    def apply_monolithic(
         self,
         layer: FusedMoE,
-        router: FusedMoERouter,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        topk_weights, topk_ids = router.select_experts(
-            hidden_states=x,
+        assert self.kernel_backend == "Flashinfer"
+        return flashinfer_trtllm_mxint4_moe(
+            x=x,
             router_logits=router_logits,
+            w13_weight_packed=layer.w13_weight_packed,
+            w13_weight_scale=layer.w13_weight_scale,
+            w2_weight_packed=layer.w2_weight_packed,
+            w2_weight_scale=layer.w2_weight_scale,
+            global_num_experts=layer.global_num_experts,
+            top_k=layer.top_k,
+            intermediate_size_per_partition=layer.intermediate_size_per_partition,
+            local_num_experts=layer.local_num_experts,
+            ep_rank=layer.ep_rank,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            e_score_correction_bias=layer.e_score_correction_bias,
+            routing_method_type=layer.routing_method_type,
         )
 
+    def apply(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert self.kernel_backend == "Marlin"
         return fused_marlin_moe(
             x,
             layer.w13_weight_packed,
@@ -1633,7 +1744,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             None,
             layer.w13_weight_scale,
             layer.w2_weight_scale,
-            router_logits,
             topk_weights,
             topk_ids,
             input_global_scale1=getattr(layer, "w13_input_global_scale", None),
@@ -1650,6 +1760,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             workspace=layer.workspace,
             input_dtype=self.marlin_input_dtype,
             is_k_full=self.is_k_full,
+            inplace=not self.moe.disable_inplace,
         )
 
 
@@ -1806,21 +1917,82 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.a2_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Reconfigure packed weights and scales to match moe_wna16 format
-        layer.w13_weight_packed = torch.nn.Parameter(
-            layer.w13_weight_packed.transpose(1, 2).contiguous().view(torch.uint8),
-            requires_grad=False,
-        )
-        layer.w2_weight_packed = torch.nn.Parameter(
-            layer.w2_weight_packed.transpose(1, 2).contiguous().view(torch.uint8),
-            requires_grad=False,
-        )
-        layer.w13_weight_scale = torch.nn.Parameter(
-            layer.w13_weight_scale.transpose(1, 2).contiguous(), requires_grad=False
-        )
-        layer.w2_weight_scale = torch.nn.Parameter(
-            layer.w2_weight_scale.transpose(1, 2).contiguous(), requires_grad=False
-        )
+        import vllm.envs as envs
+
+        if envs.VLLM_MOE_EXLLAMA and self.num_bits == 4:
+            # Exllama MoE path: keep weights in [E, K/8, N] int32 format
+            # and apply gptq_shuffle for the exllama kernel's SIMD layout.
+            from vllm._custom_ops import gptq_shuffle
+
+            device = layer.w13_weight_packed.device
+            dummy_perm = torch.empty(0, dtype=torch.int32, device=device)
+            for e in range(layer.w13_weight_packed.size(0)):
+                gptq_shuffle(layer.w13_weight_packed.data[e], dummy_perm, self.num_bits)
+                gptq_shuffle(layer.w2_weight_packed.data[e], dummy_perm, self.num_bits)
+            # Scales are already [E, groups, N] — keep as-is for exllama.
+
+            # Create synthetic qzeros for the exllama kernel.
+            # Symmetric 4-bit: zero_point = 8 (midpoint of 0..15).
+            # GPTQv1 kernel adds +1, so store 7 per nibble.
+            # 8 nibbles of 7 packed into int32 = 0x77777777.
+            E = layer.w13_weight_packed.size(0)
+            groups_w13 = layer.w13_weight_scale.size(1)
+            N_w13 = layer.w13_weight_packed.size(2)
+            groups_w2 = layer.w2_weight_scale.size(1)
+            N_w2 = layer.w2_weight_packed.size(2)
+
+            w13_qzeros = torch.nn.Parameter(
+                torch.full(
+                    (E, groups_w13, N_w13 // 8),
+                    0x77777777,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                requires_grad=False,
+            )
+            w2_qzeros = torch.nn.Parameter(
+                torch.full(
+                    (E, groups_w2, N_w2 // 8),
+                    0x77777777,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_qzeros", w13_qzeros)
+            layer.register_parameter("w2_qzeros", w2_qzeros)
+            layer.use_exllama_moe = True
+
+            # Build modular kernel for exllama path
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.moe_quant_config is not None
+            layer.w13_weight = layer.w13_weight_packed
+            layer.w2_weight = layer.w2_weight_packed
+            self.moe_mk = FusedMoEModularKernel(
+                fused_experts=ExllamaExperts(
+                    moe_config=self.moe, quant_config=self.moe_quant_config
+                ),
+                prepare_finalize=MoEPrepareAndFinalizeNoEP(),
+            )
+        else:
+            # Triton path: transpose + reinterpret as uint8
+            layer.w13_weight_packed = torch.nn.Parameter(
+                layer.w13_weight_packed.transpose(1, 2).contiguous().view(torch.uint8),
+                requires_grad=False,
+            )
+            layer.w2_weight_packed = torch.nn.Parameter(
+                layer.w2_weight_packed.transpose(1, 2).contiguous().view(torch.uint8),
+                requires_grad=False,
+            )
+            layer.w13_weight_scale = torch.nn.Parameter(
+                layer.w13_weight_scale.transpose(1, 2).contiguous(),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale = torch.nn.Parameter(
+                layer.w2_weight_scale.transpose(1, 2).contiguous(),
+                requires_grad=False,
+            )
+            layer.use_exllama_moe = False
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1832,11 +2004,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             else int8_w8a16_moe_quant_config
         )
 
+        use_exllama = getattr(layer, "use_exllama_moe", False)
         return config_builder(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_zp=None,
-            w2_zp=None,
+            w1_zp=getattr(layer, "w13_qzeros", None) if use_exllama else None,
+            w2_zp=getattr(layer, "w2_qzeros", None) if use_exllama else None,
             block_shape=[0, self.group_size],
         )
 
@@ -1845,37 +2018,45 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         prepare_finalize: mk.FusedMoEPrepareAndFinalize,
         layer: torch.nn.Module,
     ) -> mk.FusedMoEPermuteExpertsUnpermute:
-        if self.moe.is_lora_enabled:
-            assert self.moe_quant_config is not None
-            from vllm.triton_utils import HAS_TRITON
+        assert self.moe_quant_config is not None
+        layer.w13_weight = layer.w13_weight_packed
+        layer.w2_weight = layer.w2_weight_packed
 
-            if HAS_TRITON:
-                from vllm.model_executor.layers.fused_moe import TritonWNA16Experts
+        use_exllama = getattr(layer, "use_exllama_moe", False)
+        if use_exllama:
+            return ExllamaExperts(
+                moe_config=self.moe, quant_config=self.moe_quant_config
+            )
 
-                layer.w13_weight = layer.w13_weight_packed
-                layer.w2_weight = layer.w2_weight_packed
-                return TritonWNA16Experts(quant_config=self.moe_quant_config)
-            else:
-                raise NotImplementedError(
-                    "TritonExperts requires Triton. "
-                    "Install triton or disable LoRA for MoE."
-                )
+        from vllm.model_executor.layers.fused_moe import TritonWNA16Experts
 
-        raise NotImplementedError
+        return TritonWNA16Experts(
+            moe_config=self.moe, quant_config=self.moe_quant_config
+        )
 
     def apply(
         self,
         layer: FusedMoE,
-        router: FusedMoERouter,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from vllm.model_executor.layers.fused_moe import fused_experts
+        if self.moe_mk is not None:
+            return self.moe_mk(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                expert_map=layer.expert_map,
+            )
 
-        topk_weights, topk_ids = router.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-        )
+        # Triton WNA16 fallback (non-exllama, non-EP)
+        from vllm.model_executor.layers.fused_moe import fused_experts
 
         return fused_experts(
             x,
@@ -1883,7 +2064,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_packed,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=True,
+            inplace=not self.moe.disable_inplace,
             activation=layer.activation,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             global_num_experts=layer.global_num_experts,
@@ -2165,27 +2346,32 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         # fused_experts; quant config is not needed.
         return None
 
-    def apply(
+    @property
+    def is_monolithic(self) -> bool:
+        return True
+
+    def apply_monolithic(
         self,
         layer: FusedMoE,
-        router: FusedMoERouter,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
         assert not layer.enable_eplb, "EPLB not supported for W4A8-int MoE yet."
-        assert layer.activation in ("silu", "swigluoai", "swiglu"), (
-            "Only SiLU/SwiGLUGU/SwiGLUUG are supported."
-        )
+        assert layer.activation in (
+            MoEActivation.SILU,
+            MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUSTEP,
+        ), "Only SiLU/SwiGLUGU/SwiGLUUG are supported."
         assert layer.expert_map is None, """expert_map/EP not implemented
         for CPU dyn-4bit MoE."""
 
-        def _act_kind(s: str) -> int:
+        def _act_kind(s: MoEActivation) -> int:
             # 0 = SwiGLU_Gu (SiLU(g)*u), 1 = SwiGLU_Ug (SiLU(u)*g), 2 = SiLU
-            if s == "swiglu":
+            if s == MoEActivation.SWIGLUSTEP:
                 return 0
-            if s == "swigluoai":
+            if s == MoEActivation.SWIGLUOAI:
                 return 1
-            if s == "silu":
+            if s == MoEActivation.SILU:
                 return 2
             raise ValueError(f"Unknown activation '{s}'")
 
@@ -2467,6 +2653,7 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             c_strides2=self.a_strides1_c_strides2,
             s_strides1=self.s_strides1,
             s_strides2=self.s_strides2,
+            moe_config=self.moe,
             quant_config=self.moe_quant_config,
             group_size=self.group_size,
         )
@@ -2481,19 +2668,16 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     def apply(
         self,
         layer: FusedMoE,
-        router: FusedMoERouter,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-    ):
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if layer.enable_eplb:
             raise NotImplementedError(
                 "EPLB not supported for `CompressedTensorsW4A8Fp8MoEMethod` yet."
             )
         assert self.moe_quant_config is not None
-        topk_weights, topk_ids = router.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-        )
 
         from vllm.model_executor.layers.fused_moe.cutlass_moe import (
             cutlass_moe_w4a8_fp8,
@@ -2505,6 +2689,7 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_packed,
             topk_weights,
             topk_ids,
+            moe_config=self.moe,
             quant_config=self.moe_quant_config,
             activation=layer.activation,
             global_num_experts=layer.global_num_experts,
@@ -2518,6 +2703,7 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             s_strides1=self.s_strides1,
             s_strides2=self.s_strides2,
             group_size=self.group_size,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
         )
 
     @property
